@@ -1,1 +1,442 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover"/>
+<title>Hollow Creek — Boot (1024)</title>
+<style>
+  :root{--hud-bg: rgba(0,0,0,0.45); --hud-color:#eaeaea}
+  html,body{height:100%;margin:0;background:#000;color:var(--hud-color);font-family:monospace; -webkit-tap-highlight-color: transparent;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{display:block; width:100vmin; height:100vmin; max-width:100vw; max-height:100vh; touch-action:none; -webkit-user-select:none; image-rendering: optimizeSpeed; background:#000}
+  #ui { position:fixed; left:12px; top:12px; z-index:20; pointer-events:none; }
+  .stat { background:var(--hud-bg); color:var(--hud-color); padding:6px 8px; margin-bottom:6px; border-radius:6px; font-size:13px; }
+  #startOverlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; z-index:40; }
+  #startOverlay .card { background:rgba(0,0,0,0.75); color:#fff; padding:20px 28px; border-radius:10px; text-align:center; font-size:20px }
+  #startOverlay .hint{ font-size:12px; opacity:0.85; margin-top:8px }
+  #loading { position:fixed; left:50%; top:10px; transform:translateX(-50%); z-index:50; background:rgba(0,0,0,0.65); padding:6px 10px; border-radius:8px; font-size:13px }
+  @media (orientation:landscape) {
+    canvas{ width:100vw; height:100vh; }
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="gameCanvas" width="1024" height="1024" aria-label="Hollow Creek game canvas"></canvas>
+</div>
 
+<div id="ui" aria-hidden="true">
+  <div class="stat" id="nightStat">Night: 1</div>
+  <div class="stat" id="timeStat">12:00 AM</div>
+  <div class="stat" id="powerStat">Power: 100%</div>
+</div>
+
+<div id="loading" style="display:none">Cargando assets...</div>
+
+<div id="startOverlay">
+  <div class="card">
+    Toca para empezar<br/>
+    <div class="hint">Audio y controles se habilitan con el primer toque</div>
+  </div>
+</div>
+
+<script>
+/* =============================
+   Hollow Creek — Boot Demo (1024)
+   - Canvas internal resolution: 1024x1024
+   - Touch-first
+   - Replace assets in /assets/ as discussed
+   ============================= */
+
+const CANVAS = document.getElementById('gameCanvas');
+const ctx = CANVAS.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+const UI = {
+  night: document.getElementById('nightStat'),
+  time: document.getElementById('timeStat'),
+  power: document.getElementById('powerStat'),
+  loading: document.getElementById('loading'),
+  startOverlay: document.getElementById('startOverlay')
+};
+
+// internal logical size
+const W = CANVAS.width, H = CANVAS.height;
+
+/* -------- game state -------- */
+let started = false;
+let monitorOpen = false;
+let monitorSingle = null; // null = grid
+let night = 1;
+let hour = 0; // 0 => 12AM
+let power = 100;
+let cassidyActive = false;
+let cassidyGlitch = { next:0, active:false, end:0 };
+let doorLeftClosed = false, doorRightClosed = false;
+let assets = { imgs: {}, audios: {} };
+
+/* -------- timing config -------- */
+const HOUR_MS = 90000; // 1 hour = 90s
+const HOURS_PER_NIGHT = 7;
+
+/* -------- camera list (names) -------- */
+const CAM_KEYS = ['cam1_salon_base','cam2_baby_base','cam3_mini_base','cam4_kitchen_base','cam5_bath_base','cam6_storage_base','office_base_closed','office_open'];
+const CAM_COUNT = 7; // cams 1..6 plus office (7)
+
+/* -------- asset paths (adjust if your structure differs) -------- */
+function imgPath(name){
+  // prefer jpg for cams, png for sprites/overlays
+  if(name.startsWith('cam') || name.startsWith('office')) return `assets/cams/${name}.jpg`;
+  if(name.startsWith('door')) return `assets/doors/${name}.png`;
+  return `assets/${name}.png`;
+}
+
+/* audio paths */
+const AUDIO_PATHS = {
+  amb_night_loop: 'audio/amb_night_loop.mp3',
+  crt_static_loop: 'audio/crt_static_loop.mp3',
+  crt_open: 'audio/crt_open.mp3',
+  crt_close: 'audio/crt_close.mp3',
+  door_open: 'audio/door_open.mp3',
+  door_close: 'audio/door_close.mp3',
+  step_heavy: 'audio/step_heavy.mp3',
+  jumpscare_vale: 'audio/jumpscare_vale.mp3',
+  cassidy_static_hit: 'audio/cassidy_static_hit.mp3',
+  phone_night1: 'audio/phone_night1.mp3'
+};
+
+/* -------- utility: load images & audio -------- */
+function loadImage(key, path){
+  return new Promise(resolve=>{
+    const img = new Image();
+    img.onload = ()=>{ assets.imgs[key] = img; resolve(img); };
+    img.onerror = ()=>{ console.warn('Imagen no encontrada:', path); resolve(null); };
+    img.src = path;
+  });
+}
+function loadAudio(key,path){
+  return new Promise(resolve=>{
+    const a = new Audio();
+    a.preload = 'auto';
+    a.src = path;
+    a.oncanplaythrough = ()=>{ assets.audios[key] = a; resolve(a); };
+    a.onerror = ()=>{ console.warn('Audio no encontrado:', path); resolve(null); };
+  });
+}
+
+async function preloadAll(){
+  UI.loading.style.display = 'block';
+  // load cams (prefer jpg names)
+  const camNames = ['cam1_salon_base','cam2_baby_base','cam3_mini_base','cam4_kitchen_base','cam5_bath_base','cam6_storage_base','office_base_closed','office_open'];
+  const imgPromises = camNames.map(n => {
+    // cams are jpg — try jpg first, fall back to png
+    return loadImage(n, `assets/cams/${n}.jpg`).then(img=>{
+      if(!img) return loadImage(n, `assets/cams/${n}.png`);
+      return img;
+    });
+  });
+
+  // doors and overlays (png)
+  const otherImgs = [
+    loadImage('door_left_sprite', 'assets/doors/door_left_sprite.png'),
+    loadImage('door_right_sprite', 'assets/doors/door_right_sprite.png'),
+    loadImage('scanlines', 'assets/overlays/scanlines.png'),
+    loadImage('cassidy_static', 'assets/overlays/cassidy_static.png'),
+    loadImage('menu_crt', 'assets/ui/menu_crt.png'),
+    loadImage('cursor_double', 'assets/ui/cursor_double.png')
+  ];
+
+  // audios (if present)
+  const audioPromises = Object.entries(AUDIO_PATHS).map(([k,p]) => loadAudio(k,p));
+
+  await Promise.all([...imgPromises, ...otherImgs, ...audioPromises]);
+
+  UI.loading.style.display = 'none';
+}
+
+/* -------- start (after user gesture) -------- */
+async function startGame(){
+  if(started) return;
+  started = true;
+  UI.startOverlay.style.display = 'none';
+  await preloadAll();
+
+  // start amb audio (if available) — must be played after user gesture
+  if(assets.audios.amb_night_loop){ try{ assets.audios.amb_night_loop.loop = true; assets.audios.amb_night_loop.volume = 0.12; assets.audios.amb_night_loop.play(); }catch(e){ console.warn('audio play failed',e);} }
+  if(assets.audios.crt_static_loop){ try{ assets.audios.crt_static_loop.loop = true; assets.audios.crt_static_loop.volume = 0.06; assets.audios.crt_static_loop.play(); }catch(e){} }
+
+  // start hour ticker
+  hour = 0; night = 1; power = 100;
+  cassidyActive = (night >= 4);
+  setInterval(()=>{
+    if(!started) return;
+    hour++;
+    if(hour > HOURS_PER_NIGHT){
+      // night complete -> advance night
+      night = Math.min(7, night+1);
+      hour = 0;
+      cassidyActive = (night >= 4);
+    }
+    // small power drain
+    power = Math.max(0, power - Math.floor(Math.random()*6));
+    updateHUD();
+  }, HOUR_MS);
+
+  // schedule first cassidy glitch window
+  cassidyGlitch.next = Date.now() + 8000 + Math.random()*8000;
+
+  // kick loop
+  requestAnimationFrame(loop);
+}
+
+/* -------- HUD update -------- */
+function updateHUD(){
+  UI.night.innerText = 'Night: ' + night;
+  UI.time.innerText = (hour === 0 ? '12:00 AM' : (hour + ':00 AM'));
+  UI.power.innerText = 'Power: ' + power + '%';
+}
+
+/* -------- helper draws -------- */
+function drawPlaceholderRect(x,y,w,h,label){
+  ctx.fillStyle = '#0b0b0b';
+  ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle = '#333';
+  ctx.strokeRect(x+2,y+2,w-4,h-4);
+  ctx.fillStyle = '#888';
+  ctx.font = '18px monospace';
+  ctx.fillText(label, x+12, y+26);
+}
+
+/* monitor & layout helper */
+const thumbW = Math.floor(W*0.28), thumbH = Math.floor(H*0.22);
+
+function drawOfficeView(){
+  // base office (draw cam7 office image if available)
+  const officeImg = assets.imgs['office_base_closed'];
+  if(officeImg){
+    // draw scaled to canvas
+    ctx.drawImage(officeImg, 0, 0, W, H);
+  } else {
+    drawPlaceholderRect(0,0,W,H,'Office base (missing asset)');
+  }
+
+  // draw doors sprites if exist, otherwise rectangles
+  const leftDoorImg = assets.imgs['door_left_sprite'];
+  const rightDoorImg = assets.imgs['door_right_sprite'];
+  if(leftDoorImg) ctx.drawImage(leftDoorImg, 0, 0, W, H);
+  else {
+    ctx.fillStyle = doorLeftClosed ? '#2a2a2a' : '#0c0c0c';
+    ctx.fillRect(20, Math.floor(H*0.28), Math.floor(W*0.12), Math.floor(H*0.44));
+  }
+  if(rightDoorImg) ctx.drawImage(rightDoorImg, 0, 0, W, H);
+  else {
+    ctx.fillStyle = doorRightClosed ? '#2a2a2a' : '#0c0c0c';
+    ctx.fillRect(W - Math.floor(W*0.12) - 20, Math.floor(H*0.28), Math.floor(W*0.12), Math.floor(H*0.44));
+  }
+}
+
+function drawMonitorGrid(){
+  // dark monitor background
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0,0,W,H);
+  // draw thumbnails for cams 1..6 and office as small positions
+  const positions = [
+    {x: W*0.05, y: H*0.06, id:1},
+    {x: W*0.37, y: H*0.06, id:2},
+    {x: W*0.69, y: H*0.06, id:3},
+    {x: W*0.05, y: H*0.33, id:4},
+    {x: W*0.37, y: H*0.33, id:5},
+    {x: W*0.69, y: H*0.33, id:6},
+    {x: W*0.37, y: H*0.60, id:7}
+  ];
+  for(const p of positions){
+    const rx = Math.floor(p.x), ry = Math.floor(p.y);
+    const imgKey = (p.id === 7) ? 'office_base_closed' : 'cam' + p.id + '_salon_base';
+    const img = assets.imgs[imgKey];
+    if(img) ctx.drawImage(img, rx, ry, thumbW, thumbH);
+    else drawPlaceholderRect(rx, ry, thumbW, thumbH, 'CAM ' + p.id);
+    // label
+    ctx.fillStyle = '#ccc';
+    ctx.font = '14px monospace';
+    ctx.fillText('CAM ' + p.id, rx + 8, ry + 18);
+  }
+}
+
+function drawSingleCam(id){
+  // draw the requested cam big (fill with that cam)
+  const imgKey = (id === 7) ? 'office_base_closed' : 'cam' + id + '_salon_base';
+  const img = assets.imgs[imgKey];
+  if(img) ctx.drawImage(img, 0, 0, W, H);
+  else drawPlaceholderRect(0,0,W,H,'CAM ' + id + ' (missing)');
+}
+
+/* scanlines overlay drawing (fallback if image missing) */
+function drawScanlines(){
+  const sl = assets.imgs['scanlines'];
+  if(sl){
+    ctx.globalAlpha = 0.65;
+    ctx.drawImage(sl, 0, 0, W, H);
+    ctx.globalAlpha = 1;
+    return;
+  }
+  // fallback procedural scanlines
+  ctx.save();
+  ctx.globalAlpha = 0.06;
+  ctx.fillStyle = '#000';
+  for(let y=2;y<H;y+=2) ctx.fillRect(0,y,W,1);
+  ctx.restore();
+}
+
+/* cassidy glitch scheduler + draw */
+function updateCassidy(now){
+  if(!cassidyActive) return;
+  if(now > cassidyGlitch.next && !cassidyGlitch.active){
+    cassidyGlitch.active = true;
+    cassidyGlitch.end = now + (1200 + Math.random()*1400);
+    cassidyGlitch.next = now + (8000 + Math.random()*15000);
+  }
+  if(cassidyGlitch.active && now > cassidyGlitch.end) cassidyGlitch.active = false;
+}
+
+function drawCassidyOverlay(){
+  const img = assets.imgs['cassidy_static'];
+  if(img && cassidyGlitch.active){
+    ctx.globalAlpha = 0.45;
+    ctx.drawImage(img, 0, 0, W, H);
+    ctx.globalAlpha = 1;
+  } else if(cassidyGlitch.active){
+    // fallback: little static boxes
+    ctx.fillStyle = 'rgba(255,255,255,0.03)';
+    for(let i=0;i<180;i++){
+      const x = Math.random()*W, y = Math.random()*H;
+      ctx.fillRect(x,y,1,1);
+    }
+  }
+}
+
+/* -------- main loop -------- */
+function loop(ts){
+  // ts unused but could be used
+  ctx.clearRect(0,0,W,H);
+
+  if(!monitorOpen){
+    drawOfficeView();
+  } else {
+    if(monitorSingle !== null){
+      drawSingleCam(monitorSingle);
+    } else {
+      drawMonitorGrid();
+    }
+  }
+
+  // cassidy update happens each frame
+  updateCassidy(Date.now());
+  drawCassidyOverlay();
+
+  // overlays
+  drawScanlines();
+
+  // simple HUD drawn on canvas (redundant with DOM but helpful)
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.fillRect(8,8,260,64);
+  ctx.fillStyle = '#ddd';
+  ctx.font = '18px monospace';
+  ctx.fillText('Night: ' + night, 16, 30);
+  ctx.fillText((hour===0?'12:00 AM':(hour + ':00 AM')), 16, 54);
+
+  requestAnimationFrame(loop);
+}
+
+/* -------- input handling (touch & click) -------- */
+function handleTap(x,y){
+  // if overlay visible start game
+  if(!started) { startGame(); return; }
+
+  // bottom stripe toggles monitor
+  if(y > H * 0.80){
+    monitorOpen = !monitorOpen;
+    if(monitorOpen){
+      if(assets.audios.crt_open){ try{ assets.audios.crt_open.play(); }catch(e){} }
+    } else {
+      if(assets.audios.crt_close){ try{ assets.audios.crt_close.play(); }catch(e){} }
+      monitorSingle = null;
+    }
+    updateHUD();
+    return;
+  }
+
+  // if monitor open and touch inside grid -> select cam
+  if(monitorOpen){
+    // check thumbnails positions
+    const thumbPositions = [
+      {x: W*0.05, y: H*0.06, id:1},
+      {x: W*0.37, y: H*0.06, id:2},
+      {x: W*0.69, y: H*0.06, id:3},
+      {x: W*0.05, y: H*0.33, id:4},
+      {x: W*0.37, y: H*0.33, id:5},
+      {x: W*0.69, y: H*0.33, id:6},
+      {x: W*0.37, y: H*0.60, id:7}
+    ];
+    for(const p of thumbPositions){
+      const rx = Math.floor(p.x), ry = Math.floor(p.y);
+      if(x >= rx && x <= rx + thumbW && y >= ry && y <= ry + thumbH){
+        // entrance (7) allowed as office view
+        monitorSingle = p.id;
+        if(assets.audios.cam_switch) try{ assets.audios.cam_switch.play(); }catch(e){}
+        return;
+      }
+    }
+    // tapped monitor but not thumb -> return to grid
+    monitorSingle = null;
+    return;
+  }
+
+  // if not monitor: left/right half toggles doors
+  if(x < W*0.5){
+    doorLeftClosed = !doorLeftClosed;
+    if(doorLeftClosed && assets.audios.door_close) try{ assets.audios.door_close.play(); }catch(e){}
+    if(!doorLeftClosed && assets.audios.door_open) try{ assets.audios.door_open.play(); }catch(e){}
+  } else {
+    doorRightClosed = !doorRightClosed;
+    if(doorRightClosed && assets.audios.door_close) try{ assets.audios.door_close.play(); }catch(e){}
+    if(!doorRightClosed && assets.audios.door_open) try{ assets.audios.door_open.play(); }catch(e){}
+  }
+}
+
+/* translate client coords to canvas coords (since canvas scales in CSS) */
+function getCanvasCoords(clientX, clientY){
+  const rect = CANVAS.getBoundingClientRect();
+  const scaleX = CANVAS.width / rect.width;
+  const scaleY = CANVAS.height / rect.height;
+  return { x: Math.floor((clientX - rect.left) * scaleX), y: Math.floor((clientY - rect.top) * scaleY) };
+}
+
+CANVAS.addEventListener('click', (ev)=> {
+  const p = getCanvasCoords(ev.clientX, ev.clientY);
+  handleTap(p.x, p.y);
+});
+CANVAS.addEventListener('touchstart', (ev)=> {
+  ev.preventDefault();
+  const t = ev.touches[0];
+  const p = getCanvasCoords(t.clientX, t.clientY);
+  handleTap(p.x, p.y);
+}, {passive:false});
+
+/* start overlay tap */
+UI.startOverlay.addEventListener('click', ()=> startGame());
+UI.startOverlay.addEventListener('touchstart', ()=> startGame(), {passive:false});
+
+/* safety: attempt to start loop anyway but visuals only after start */
+requestAnimationFrame(loop);
+
+/* expose debug (console) */
+window._assets = assets;
+window._startGame = startGame;
+window._toggleMonitor = ()=>{ monitorOpen = !monitorOpen; };
+window._setNight = (n)=>{ night = n; cassidyActive = (night>=4); updateHUD(); };
+
+updateHUD();
+
+</script>
+</body>
+</html>
